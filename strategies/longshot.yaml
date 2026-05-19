@@ -1,0 +1,23 @@
+name: longshot
+description: Buy NO on longshot sports contracts
+enabled: false
+
+filters:
+  categories:
+    - Sports
+    - NFL
+    - NBA
+    - MLB
+    - NHL
+  min_yes_price: 0.02
+  max_yes_price: 0.19
+  exclude_tickers_containing:
+    - MENTION
+  exclude_multivariate: true
+
+order:
+  side: "no"
+  contracts_per_market: 10
+  pricing:
+    mode: at_bid
+  post_only: true

@@ -1,0 +1,37 @@
+# Environment
+.env
+*.pem
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+*.egg-info/
+dist/
+build/
+venv/
+.venv/
+
+# Logs
+logs/*
+!logs/.gitignore
+
+# State (resume data)
+state/
+
+# Database
+data/
+
+# PnL reports (contain account data)
+pnl_reports/
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# Worktrees
+.worktrees/
+
+nul

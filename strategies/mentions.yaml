@@ -1,0 +1,33 @@
+name: mentions
+description: Buy NO on Mention markets with volume > 500
+enabled: true
+
+filters:
+  categories:
+    - Mentions
+  tags:
+    - Mentions
+  excluded_keywords:
+    - elbow
+    - does not qualify
+  min_volume: 0
+  min_no_bid_price: 0.20
+  max_no_bid_price: 0.85
+  min_close_hours: 0
+  max_close_hours: 30
+
+guard: true
+
+order:
+  side: "no"
+  contracts_per_market: 500
+  pricing:
+    mode: ladder
+    levels: 7
+    start_offset: 0
+    step: -1
+  post_only: true
+
+reprice:
+  enabled: false
+  after_hours: 6
