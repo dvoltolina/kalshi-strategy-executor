@@ -20,10 +20,10 @@ guard: true
 
 order:
   side: "no"
-  contracts_per_market: 500
+  contracts_per_market: 5
   pricing:
     mode: ladder
-    levels: 7
+    levels: 3
     start_offset: 0
     step: -1
   post_only: true
