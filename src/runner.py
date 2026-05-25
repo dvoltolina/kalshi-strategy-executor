@@ -8,7 +8,12 @@ from typing import Any, Optional, TYPE_CHECKING
 
 from datetime import timezone as tz
 
-from src.order_budget import OrderBudget
+from src.order_budget import (
+    BudgetSnapshotError,
+    OrderBudget,
+    build_budget,
+    order_notional_cents,
+)
 from src.strategies import discover_guarded_strategies, discover_strategies
 from typing import Dict, List
 
@@ -101,6 +106,23 @@ class Runner:
             self._warm_guard_cache()
         except Exception:
             logger.exception("Guard cache warm failed — continuing")
+
+        # 3c. Surface budget posture at startup (the trade ticks build their
+        # own per-tick budget; this one is purely for operator visibility so
+        # they don't wait until :00/:30 to learn the cap is in effect).
+        try:
+            startup_budget = self._build_order_budget()
+            if startup_budget.cap_cents > 0:
+                print(
+                    f"  Budget: cap=${self.config.max_total_notional_usd:.2f}, "
+                    f"committed=${startup_budget.committed_cents/100:.2f}, "
+                    f"remaining=${startup_budget.remaining_cents/100:.2f}"
+                )
+            else:
+                print("  Budget: no cap (DRY_RUN with MAX_TOTAL_NOTIONAL_USD unset)")
+        except BudgetSnapshotError as e:
+            print(f"  Budget: snapshot failed at startup ({e})")
+            logger.error(f"Startup budget snapshot failed: {e}", exc_info=True)
 
         # 4. Enter tick loop
         print()
@@ -396,7 +418,15 @@ class Runner:
             print(f"[{tick_time}] Trading: no strategies found")
             return
 
-        budget = self._build_order_budget()
+        try:
+            budget = self._build_order_budget()
+        except BudgetSnapshotError as e:
+            logger.error(
+                f"[{tick_time}] Aborting trading: budget snapshot failed: {e}",
+                exc_info=True,
+            )
+            print(f"[{tick_time}] Trading: skipped (budget snapshot failed)")
+            return
         placer = OrderPlacer(client=self.client, dry_run=self.dry_run, budget=budget)
         committed = self._get_portfolio_commitment()
         total_successes = 0
@@ -700,7 +730,15 @@ class Runner:
             return
 
         # Reprice re-places live orders; honor the same global $ cap.
-        budget = self._build_order_budget()
+        # If snapshot fails, skip the cycle rather than reprice blind.
+        try:
+            budget = self._build_order_budget()
+        except BudgetSnapshotError as e:
+            logger.error(
+                f"[reprice] Aborting: budget snapshot failed: {e}", exc_info=True
+            )
+            print(f"[{tick_time}] Reprice: skipped (budget snapshot failed)")
+            return
         placer = OrderPlacer(client=self.client, dry_run=self.dry_run, budget=budget)
         repriced = 0
         skipped = 0
@@ -780,6 +818,11 @@ class Runner:
                         self.db.update_order_status(
                             order_id, "cancelled", filled_quantity=fill_count
                         )
+                        # Refund the cancelled order's notional to the budget so
+                        # the re-placement can actually fit. Without this, the
+                        # snapshot still counts the just-cancelled order and the
+                        # reservation for the replacement fails — see audit.
+                        budget.release_committed(order_notional_cents(order))
                         logger.info(
                             f"[reprice] cancelled {order_id} ({ticker}, {age_hours:.1f}h old, "
                             f"{fill_count} filled)"
@@ -789,6 +832,8 @@ class Runner:
                         cancel_ok = False
                         break
                 else:
+                    # Dry-run: also refund so dry-run shows correct headroom.
+                    budget.release_committed(order_notional_cents(order))
                     logger.info(
                         f"[reprice] [DRY RUN] would cancel {order_id} ({ticker}, {age_hours:.1f}h old)"
                     )
@@ -855,86 +900,12 @@ class Runner:
     def _build_order_budget(self) -> OrderBudget:
         """Build a per-tick OrderBudget from current Kalshi exposure.
 
-        cap_cents == 0 signals 'no cap' (dry-run + unset env var).
-        Live mode is guaranteed by config.load_config to have a cap.
+        Delegates to :func:`order_budget.build_budget`. Raises
+        ``BudgetSnapshotError`` on Kalshi API failure so the caller
+        (``_tick``) can abort placing orders this cycle rather than
+        proceeding with an unreliable exposure snapshot.
         """
-        cap_usd = self.config.max_total_notional_usd
-        if cap_usd is None:
-            return OrderBudget(cap_cents=0, committed_cents=0)
-
-        committed_cents = self._estimate_committed_notional_cents()
-        cap_cents = int(round(cap_usd * 100))
-        budget = OrderBudget(cap_cents=cap_cents, committed_cents=committed_cents)
-        logger.info(
-            f"Budget: cap=${cap_usd:.2f}, committed=${committed_cents/100:.2f}, "
-            f"remaining=${budget.remaining_cents/100:.2f}"
-        )
-        if budget.remaining_cents == 0:
-            logger.warning(
-                "Budget exhausted at tick start; no new orders this cycle"
-            )
-        return budget
-
-    def _estimate_committed_notional_cents(self) -> int:
-        """Sum cents tied up in held positions + unfilled resting orders.
-
-        Strategy: prefer Kalshi's reported per-position market_exposure (cents)
-        and per-order limit price; fall back to (contracts × 100c) as a strictly
-        conservative upper bound when fields are missing.
-        """
-        total = 0
-
-        cursor = None
-        while True:
-            try:
-                result = self.client.get_positions(
-                    limit=100, cursor=cursor, count_filter="position"
-                )
-            except Exception as e:
-                logger.error(
-                    f"Error fetching positions for budget: {e}", exc_info=True
-                )
-                break
-            for pos in result.get("market_positions", []):
-                count = abs(pos.get("position", 0))
-                if count <= 0:
-                    continue
-                exposure = pos.get("market_exposure")
-                if isinstance(exposure, (int, float)) and exposure > 0:
-                    total += int(exposure)
-                else:
-                    total += count * 100  # conservative fallback: $1/contract
-            cursor = result.get("cursor")
-            if not cursor or not result.get("market_positions"):
-                break
-
-        cursor = None
-        while True:
-            try:
-                result = self.client.get_orders(
-                    status="resting", limit=100, cursor=cursor
-                )
-            except Exception as e:
-                logger.error(
-                    f"Error fetching resting orders for budget: {e}", exc_info=True
-                )
-                break
-            for order in result.get("orders", []):
-                remaining = order.get("remaining_count", 0)
-                if remaining <= 0:
-                    continue
-                side = order.get("side", "")
-                price = order.get(
-                    "no_price" if side == "no" else "yes_price"
-                )
-                if not isinstance(price, (int, float)) or price <= 0:
-                    price = 100  # conservative fallback
-                total += remaining * int(price)
-            cursor = result.get("cursor")
-            if not cursor or not result.get("orders"):
-                break
-
-        return total
+        return build_budget(self.client, self.config.max_total_notional_usd)
 
     def _get_portfolio_commitment(self) -> Dict[str, int]:
         """Fetch current positions + resting orders from Kalshi API.

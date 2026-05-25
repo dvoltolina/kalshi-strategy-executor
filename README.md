@@ -134,6 +134,7 @@ Global config comes from `.env`.
 | `KALSHI_API_BASE_URL` | No | Kalshi production URL | REST API base URL. |
 | `XAI_API_KEY` | Yes for trading/guard | none | xAI key used by the guard when Kalshi milestones do not provide start times. |
 | `DRY_RUN` | No | `false` in code, `true` in `.env.example` | If true, no live orders or cancellations are sent. |
+| `MAX_TOTAL_NOTIONAL_USD` | **Yes when `DRY_RUN=false`** | none | Global cap on outstanding USD exposure (resting orders + held positions). Startup raises `ConfigError` if missing in live mode. Minimum 0.01. |
 | `LOG_LEVEL` | No | `INFO` | `DEBUG`, `INFO`, `WARNING`, or `ERROR`. |
 | `DATABASE_PATH` | No | `data/orders.db` | SQLite database path. |
 | `SUBACCOUNT_NUMBER` | No | none | Optional subaccount number, 1-32. |
@@ -176,9 +177,9 @@ Current defaults:
 - Filters by Mentions category and Mentions tag.
 - Excludes disqualified/NQE markets and configured keywords.
 - Requires NO bid between 20c and 85c.
-- Places a seven-level ladder of post-only NO buy orders.
+- Places a three-level ladder of post-only NO buy orders.
 - Allocates `contracts_per_market` across the ladder.
-- Current default `contracts_per_market` is 500.
+- Current default `contracts_per_market` is 5 (sized for a small funded account; raise for larger balances).
 
 Example:
 
@@ -197,10 +198,10 @@ guard: true
 
 order:
   side: "no"
-  contracts_per_market: 500
+  contracts_per_market: 5
   pricing:
     mode: ladder
-    levels: 7
+    levels: 3
     start_offset: 0
     step: -1
   post_only: true
@@ -209,6 +210,10 @@ order:
 Ladder mode starts at the current best NO bid plus `start_offset`, then steps
 by `step` cents for each level. With `step: -1`, the ladder moves downward
 from the best bid, providing resting depth at lower NO prices.
+
+Worst-case dollar exposure per market is `contracts_per_market * max_no_bid_price`.
+With the defaults above and `max_no_bid_price: 0.85`, that is $4.25 per market.
+Always sanity-check this number against your `MAX_TOTAL_NOTIONAL_USD` cap.
 
 ### Longshot Strategy
 
@@ -266,6 +271,18 @@ Only one mode can be selected at a time.
 ```bash
 uv run python -m src.main --list-strategies
 ```
+
+### Going Live — Safe First Run
+
+Recommended ramp before letting the continuous runner go unsupervised:
+
+1. Keep `DRY_RUN=true` and watch a full hour of `uv run python -m src.main --run --dry-run`. Verify the `Budget: cap=$X.XX ...` line appears at startup and at each trade tick.
+2. Flip `DRY_RUN=false` in `.env`. Confirm `MAX_TOTAL_NOTIONAL_USD` is set; startup will fail fast if it isn't.
+3. Do a single hand-confirmed order first: `uv run python -m src.main --strategy mentions --confirm`. The bot prints each order plus your remaining budget; type `n` on anything you don't want placed.
+4. Inspect the resting order on Kalshi's UI. Wait for either a fill, a cancellation by the guard, or expiry.
+5. Only once you're satisfied with that one round-trip, switch to `--run`.
+
+This bot has no daily loss limit, no stop-loss, and no "max trades per day" — `MAX_TOTAL_NOTIONAL_USD` is the only automated brake on outstanding exposure.
 
 ### One-Shot Strategy Run
 

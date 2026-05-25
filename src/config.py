@@ -108,8 +108,12 @@ def load_config(skip_file_check: bool = False) -> Config:
             max_total_notional_usd = float(mtn_str)
         except ValueError:
             raise ConfigError("MAX_TOTAL_NOTIONAL_USD must be a number")
-        if max_total_notional_usd <= 0:
-            raise ConfigError("MAX_TOTAL_NOTIONAL_USD must be > 0")
+        # Reject values that round to 0 cents — the OrderBudget treats
+        # cap_cents=0 as a "no cap" sentinel, so a typo like 0.004 would
+        # silently disable the safety cap in live trading. Require at
+        # least 1 cent ($0.01).
+        if max_total_notional_usd < 0.01:
+            raise ConfigError("MAX_TOTAL_NOTIONAL_USD must be >= 0.01")
     else:
         max_total_notional_usd = None
 

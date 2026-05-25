@@ -153,7 +153,21 @@ def test_load_config_notional_cap_must_be_positive():
     }
     with patch.dict(os.environ, env, clear=True):
         from src.config import load_config, ConfigError
-        with pytest.raises(ConfigError, match="MAX_TOTAL_NOTIONAL_USD must be > 0"):
+        with pytest.raises(ConfigError, match="MAX_TOTAL_NOTIONAL_USD must be >= 0.01"):
+            load_config(skip_file_check=True)
+
+
+def test_load_config_notional_cap_rejects_sub_cent():
+    """A typo like 0.004 must not silently disable the cap (would round to 0)."""
+    env = {
+        "KALSHI_API_KEY_ID": "test-key-id",
+        "KALSHI_PRIVATE_KEY_PATH": "/tmp/test.pem",
+        "DRY_RUN": "true",
+        "MAX_TOTAL_NOTIONAL_USD": "0.004",
+    }
+    with patch.dict(os.environ, env, clear=True):
+        from src.config import load_config, ConfigError
+        with pytest.raises(ConfigError, match=">= 0.01"):
             load_config(skip_file_check=True)
 
 

@@ -16,7 +16,7 @@ from src.config import load_config, ConfigError
 from src.database import Database
 from src.kalshi_client import KalshiClient, KalshiAPIError
 from src.logging_config import setup_logging
-from src.order_budget import OrderBudget
+from src.order_budget import BudgetSnapshotError, OrderBudget, build_budget
 from src.order_guard import OrderGuard
 from src.order_placer import OrderPlacer, build_market_url
 from src.settlement_checker import SettlementChecker
@@ -127,74 +127,6 @@ Examples:
     )
 
     return parser.parse_args(args)
-
-
-def _build_one_shot_budget(client: "KalshiClient", config) -> OrderBudget:
-    """Build an OrderBudget for the one-shot CLI path.
-
-    Mirrors Runner._build_order_budget but inline here to keep main.py
-    self-contained for the one-shot mode. cap_cents == 0 = no-cap (dry-run).
-    """
-    cap_usd = config.max_total_notional_usd
-    if cap_usd is None:
-        return OrderBudget(cap_cents=0, committed_cents=0)
-
-    total = 0
-    # Held positions
-    cursor = None
-    while True:
-        try:
-            result = client.get_positions(
-                limit=100, cursor=cursor, count_filter="position"
-            )
-        except Exception as e:
-            logger.error(f"Error fetching positions for budget: {e}", exc_info=True)
-            break
-        for pos in result.get("market_positions", []):
-            count = abs(pos.get("position", 0))
-            if count <= 0:
-                continue
-            exposure = pos.get("market_exposure")
-            if isinstance(exposure, (int, float)) and exposure > 0:
-                total += int(exposure)
-            else:
-                total += count * 100
-        cursor = result.get("cursor")
-        if not cursor or not result.get("market_positions"):
-            break
-
-    # Resting orders
-    cursor = None
-    while True:
-        try:
-            result = client.get_orders(status="resting", limit=100, cursor=cursor)
-        except Exception as e:
-            logger.error(f"Error fetching resting orders for budget: {e}", exc_info=True)
-            break
-        for order in result.get("orders", []):
-            remaining = order.get("remaining_count", 0)
-            if remaining <= 0:
-                continue
-            side = order.get("side", "")
-            price = order.get("no_price" if side == "no" else "yes_price")
-            if not isinstance(price, (int, float)) or price <= 0:
-                price = 100
-            total += remaining * int(price)
-        cursor = result.get("cursor")
-        if not cursor or not result.get("orders"):
-            break
-
-    cap_cents = int(round(cap_usd * 100))
-    budget = OrderBudget(cap_cents=cap_cents, committed_cents=total)
-    logger.info(
-        f"Budget: cap=${cap_usd:.2f}, committed=${total/100:.2f}, "
-        f"remaining=${budget.remaining_cents/100:.2f}"
-    )
-    if budget.remaining_cents == 0:
-        logger.warning(
-            "Budget exhausted at startup; no new orders will be placed"
-        )
-    return budget
 
 
 def run_strategy(strategy_name: str, config_path: Optional[str], dry_run: bool, confirm: bool = False) -> int:
@@ -341,7 +273,14 @@ def run_strategy(strategy_name: str, config_path: Optional[str], dry_run: bool, 
 
     # Build budget from current Kalshi exposure for one-shot run.
     # In dry-run with no env cap, this yields a no-cap budget.
-    budget = _build_one_shot_budget(client, global_config)
+    # If the snapshot fails (Kalshi API blip), abort: we won't deploy
+    # capital with unknown remaining headroom.
+    try:
+        budget = build_budget(client, global_config.max_total_notional_usd)
+    except BudgetSnapshotError as e:
+        print(f"Aborting: budget snapshot failed ({e})")
+        logger.error(f"One-shot aborted: budget snapshot failed: {e}", exc_info=True)
+        return 1
 
     placer = OrderPlacer(
         client=client,
@@ -405,6 +344,8 @@ def run_strategy(strategy_name: str, config_path: Optional[str], dry_run: bool, 
                 if yes_bid:
                     print(f"  YES bid: ${yes_bid:.2f}")
                 print(f"  Total cost: ${order_params.price_cents * order_params.quantity / 100:.2f}")
+                if placer.budget is not None and placer.budget.cap_cents > 0:
+                    print(f"  Budget remaining: ${placer.budget.remaining_cents/100:.2f}")
                 print()
 
                 response = input("Place this order? [y/N]: ").strip().lower()
