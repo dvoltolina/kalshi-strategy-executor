@@ -14,6 +14,7 @@ def test_load_config_success():
         "SPORTS_CATEGORIES": "NFL,NBA",
         "DRY_RUN": "false",
         "LOG_LEVEL": "INFO",
+        "MAX_TOTAL_NOTIONAL_USD": "45",
     }
     with patch.dict(os.environ, env, clear=True):
         from src.config import load_config
@@ -29,6 +30,7 @@ def test_load_config_success():
         assert config.max_no_price == 0.98  # 1 - 0.02
         assert config.sports_categories == ["NFL", "NBA"]
         assert config.dry_run is False
+        assert config.max_total_notional_usd == 45.0
 
 
 def test_load_config_missing_api_key():
@@ -75,6 +77,7 @@ def test_load_config_optional_subaccount():
         "KALSHI_API_KEY_ID": "test-key-id",
         "KALSHI_PRIVATE_KEY_PATH": "/tmp/test.pem",
         "SUBACCOUNT_NUMBER": "",
+        "DRY_RUN": "true",
     }
     with patch.dict(os.environ, env, clear=True):
         from src.config import load_config
@@ -90,6 +93,7 @@ def test_load_config_with_database_path(monkeypatch, tmp_path):
     monkeypatch.setenv("KALSHI_API_KEY_ID", "test-key")
     monkeypatch.setenv("KALSHI_PRIVATE_KEY_PATH", str(key_file))
     monkeypatch.setenv("DATABASE_PATH", "custom/path/orders.db")
+    monkeypatch.setenv("DRY_RUN", "true")
 
     from src.config import load_config
     config = load_config()
@@ -104,9 +108,63 @@ def test_load_config_default_database_path(monkeypatch, tmp_path):
 
     monkeypatch.setenv("KALSHI_API_KEY_ID", "test-key")
     monkeypatch.setenv("KALSHI_PRIVATE_KEY_PATH", str(key_file))
+    monkeypatch.setenv("DRY_RUN", "true")
     # Don't set DATABASE_PATH
 
     from src.config import load_config
     config = load_config()
 
     assert config.database_path == "data/orders.db"
+
+
+def test_load_config_requires_notional_cap_when_live():
+    """Live trading must declare MAX_TOTAL_NOTIONAL_USD; startup fails otherwise."""
+    env = {
+        "KALSHI_API_KEY_ID": "test-key-id",
+        "KALSHI_PRIVATE_KEY_PATH": "/tmp/test.pem",
+        "DRY_RUN": "false",
+        # MAX_TOTAL_NOTIONAL_USD intentionally omitted
+    }
+    with patch.dict(os.environ, env, clear=True):
+        from src.config import load_config, ConfigError
+        with pytest.raises(ConfigError, match="MAX_TOTAL_NOTIONAL_USD"):
+            load_config(skip_file_check=True)
+
+
+def test_load_config_notional_cap_optional_in_dry_run():
+    """Dry-run permits MAX_TOTAL_NOTIONAL_USD to be unset."""
+    env = {
+        "KALSHI_API_KEY_ID": "test-key-id",
+        "KALSHI_PRIVATE_KEY_PATH": "/tmp/test.pem",
+        "DRY_RUN": "true",
+    }
+    with patch.dict(os.environ, env, clear=True):
+        from src.config import load_config
+        config = load_config(skip_file_check=True)
+        assert config.max_total_notional_usd is None
+
+
+def test_load_config_notional_cap_must_be_positive():
+    env = {
+        "KALSHI_API_KEY_ID": "test-key-id",
+        "KALSHI_PRIVATE_KEY_PATH": "/tmp/test.pem",
+        "DRY_RUN": "true",
+        "MAX_TOTAL_NOTIONAL_USD": "0",
+    }
+    with patch.dict(os.environ, env, clear=True):
+        from src.config import load_config, ConfigError
+        with pytest.raises(ConfigError, match="MAX_TOTAL_NOTIONAL_USD must be > 0"):
+            load_config(skip_file_check=True)
+
+
+def test_load_config_notional_cap_must_be_numeric():
+    env = {
+        "KALSHI_API_KEY_ID": "test-key-id",
+        "KALSHI_PRIVATE_KEY_PATH": "/tmp/test.pem",
+        "DRY_RUN": "true",
+        "MAX_TOTAL_NOTIONAL_USD": "forty-five",
+    }
+    with patch.dict(os.environ, env, clear=True):
+        from src.config import load_config, ConfigError
+        with pytest.raises(ConfigError, match="MAX_TOTAL_NOTIONAL_USD must be a number"):
+            load_config(skip_file_check=True)

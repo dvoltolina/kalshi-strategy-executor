@@ -8,6 +8,7 @@ from typing import Any, Optional, TYPE_CHECKING
 
 from datetime import timezone as tz
 
+from src.order_budget import OrderBudget
 from src.strategies import discover_guarded_strategies, discover_strategies
 from typing import Dict, List
 
@@ -395,7 +396,8 @@ class Runner:
             print(f"[{tick_time}] Trading: no strategies found")
             return
 
-        placer = OrderPlacer(client=self.client, dry_run=self.dry_run)
+        budget = self._build_order_budget()
+        placer = OrderPlacer(client=self.client, dry_run=self.dry_run, budget=budget)
         committed = self._get_portfolio_commitment()
         total_successes = 0
         total_failures = 0
@@ -697,7 +699,9 @@ class Runner:
             logger.error(f"[reprice] failed to load mentions strategy: {e}", exc_info=True)
             return
 
-        placer = OrderPlacer(client=self.client, dry_run=self.dry_run)
+        # Reprice re-places live orders; honor the same global $ cap.
+        budget = self._build_order_budget()
+        placer = OrderPlacer(client=self.client, dry_run=self.dry_run, budget=budget)
         repriced = 0
         skipped = 0
         now_utc = datetime.now(tz.utc)
@@ -847,6 +851,90 @@ class Runner:
     # ------------------------------------------------------------------
     # Portfolio
     # ------------------------------------------------------------------
+
+    def _build_order_budget(self) -> OrderBudget:
+        """Build a per-tick OrderBudget from current Kalshi exposure.
+
+        cap_cents == 0 signals 'no cap' (dry-run + unset env var).
+        Live mode is guaranteed by config.load_config to have a cap.
+        """
+        cap_usd = self.config.max_total_notional_usd
+        if cap_usd is None:
+            return OrderBudget(cap_cents=0, committed_cents=0)
+
+        committed_cents = self._estimate_committed_notional_cents()
+        cap_cents = int(round(cap_usd * 100))
+        budget = OrderBudget(cap_cents=cap_cents, committed_cents=committed_cents)
+        logger.info(
+            f"Budget: cap=${cap_usd:.2f}, committed=${committed_cents/100:.2f}, "
+            f"remaining=${budget.remaining_cents/100:.2f}"
+        )
+        if budget.remaining_cents == 0:
+            logger.warning(
+                "Budget exhausted at tick start; no new orders this cycle"
+            )
+        return budget
+
+    def _estimate_committed_notional_cents(self) -> int:
+        """Sum cents tied up in held positions + unfilled resting orders.
+
+        Strategy: prefer Kalshi's reported per-position market_exposure (cents)
+        and per-order limit price; fall back to (contracts × 100c) as a strictly
+        conservative upper bound when fields are missing.
+        """
+        total = 0
+
+        cursor = None
+        while True:
+            try:
+                result = self.client.get_positions(
+                    limit=100, cursor=cursor, count_filter="position"
+                )
+            except Exception as e:
+                logger.error(
+                    f"Error fetching positions for budget: {e}", exc_info=True
+                )
+                break
+            for pos in result.get("market_positions", []):
+                count = abs(pos.get("position", 0))
+                if count <= 0:
+                    continue
+                exposure = pos.get("market_exposure")
+                if isinstance(exposure, (int, float)) and exposure > 0:
+                    total += int(exposure)
+                else:
+                    total += count * 100  # conservative fallback: $1/contract
+            cursor = result.get("cursor")
+            if not cursor or not result.get("market_positions"):
+                break
+
+        cursor = None
+        while True:
+            try:
+                result = self.client.get_orders(
+                    status="resting", limit=100, cursor=cursor
+                )
+            except Exception as e:
+                logger.error(
+                    f"Error fetching resting orders for budget: {e}", exc_info=True
+                )
+                break
+            for order in result.get("orders", []):
+                remaining = order.get("remaining_count", 0)
+                if remaining <= 0:
+                    continue
+                side = order.get("side", "")
+                price = order.get(
+                    "no_price" if side == "no" else "yes_price"
+                )
+                if not isinstance(price, (int, float)) or price <= 0:
+                    price = 100  # conservative fallback
+                total += remaining * int(price)
+            cursor = result.get("cursor")
+            if not cursor or not result.get("orders"):
+                break
+
+        return total
 
     def _get_portfolio_commitment(self) -> Dict[str, int]:
         """Fetch current positions + resting orders from Kalshi API.

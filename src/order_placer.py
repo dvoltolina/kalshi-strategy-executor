@@ -10,6 +10,7 @@ import requests
 
 from src.kalshi_client import KalshiClient, KalshiAPIError
 from src.market_scanner import QualifyingMarket
+from src.order_budget import OrderBudget
 
 if TYPE_CHECKING:
     from src.strategies.base import OrderParams
@@ -82,12 +83,14 @@ class OrderPlacer:
         dry_run: bool = False,
         max_retries: int = 3,
         retry_base_delay: float = 1.0,
+        budget: Optional[OrderBudget] = None,
     ):
         self.client = client
         self.contract_count = contract_count
         self.dry_run = dry_run
         self.max_retries = max_retries
         self.retry_base_delay = retry_base_delay
+        self.budget = budget
 
     def _retry(self, fn: Callable, ticker: str) -> Dict[str, Any]:
         """Execute fn with exponential backoff on retryable errors.
@@ -191,6 +194,27 @@ class OrderPlacer:
         if yes_bid and yes_bid > 1:
             yes_bid = yes_bid / 100
 
+        # Pre-flight budget check. Reservation is released on live failure
+        # below; dry-run reservations stay so they reflect a "would-have-rested"
+        # order, matching what a real placement would consume.
+        notional_cents = params.price_cents * params.quantity
+        if self.budget is not None and not self.budget.try_reserve(notional_cents):
+            logger.warning(
+                f"Order rejected by budget: {params.ticker} "
+                f"{params.quantity}x @ {params.price_cents}c "
+                f"(notional=${notional_cents/100:.2f}, "
+                f"remaining=${self.budget.remaining_cents/100:.2f})"
+            )
+            return OrderResult(
+                market_ticker=params.ticker,
+                success=False,
+                client_order_id=client_order_id,
+                error="account notional cap reached",
+                strategy=strategy,
+                price_cents=params.price_cents,
+                quantity=params.quantity,
+            )
+
         if self.dry_run:
             logger.info(
                 f"[DRY RUN] Would place order: {params.ticker} "
@@ -254,6 +278,8 @@ class OrderPlacer:
             )
 
         except KalshiAPIError as e:
+            if self.budget is not None:
+                self.budget.release(notional_cents)
             logger.error(f"Order failed for {params.ticker}: {e.message}", exc_info=True)
             yes_bid = snapshot.get("yes_bid")
             yes_ask = snapshot.get("yes_ask")
@@ -272,6 +298,8 @@ class OrderPlacer:
                 strategy=strategy,
             )
         except Exception as e:
+            if self.budget is not None:
+                self.budget.release(notional_cents)
             logger.error(f"Unexpected error for {params.ticker}: {str(e)}", exc_info=True)
             return OrderResult(
                 market_ticker=params.ticker,

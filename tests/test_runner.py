@@ -15,6 +15,7 @@ def mock_config():
     config.grok_api_key = None
     config.database_path = ":memory:"
     config.log_level = "INFO"
+    config.max_total_notional_usd = None  # no-cap mode for runner tests
     return config
 
 

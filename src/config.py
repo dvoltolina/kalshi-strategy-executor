@@ -19,6 +19,7 @@ class Config:
     log_level: str
     database_path: str
     grok_api_key: Optional[str]
+    max_total_notional_usd: Optional[float]  # None = unlimited (dry-run only)
 
 
 class ConfigError(Exception):
@@ -100,6 +101,25 @@ def load_config(skip_file_check: bool = False) -> Config:
 
     grok_api_key = os.environ.get("XAI_API_KEY")
 
+    mtn_str = os.environ.get("MAX_TOTAL_NOTIONAL_USD", "").strip()
+    max_total_notional_usd: Optional[float]
+    if mtn_str:
+        try:
+            max_total_notional_usd = float(mtn_str)
+        except ValueError:
+            raise ConfigError("MAX_TOTAL_NOTIONAL_USD must be a number")
+        if max_total_notional_usd <= 0:
+            raise ConfigError("MAX_TOTAL_NOTIONAL_USD must be > 0")
+    else:
+        max_total_notional_usd = None
+
+    # Hard requirement when not in dry-run: live trading must have a $ cap.
+    if not dry_run and max_total_notional_usd is None:
+        raise ConfigError(
+            "MAX_TOTAL_NOTIONAL_USD must be set when DRY_RUN=false "
+            "(safety cap for live trading)"
+        )
+
     # Derive NO price range from YES price range (complement)
     min_no_price = 1.0 - max_yes_price  # e.g., 1 - 0.19 = 0.81
     max_no_price = 1.0 - min_yes_price  # e.g., 1 - 0.02 = 0.98
@@ -119,4 +139,5 @@ def load_config(skip_file_check: bool = False) -> Config:
         log_level=log_level,
         database_path=database_path,
         grok_api_key=grok_api_key,
+        max_total_notional_usd=max_total_notional_usd,
     )

@@ -6,6 +6,7 @@ import requests
 
 from src.strategies.base import OrderParams
 from src.kalshi_client import KalshiAPIError
+from src.order_budget import OrderBudget
 from src.order_placer import OrderPlacer, _is_retryable
 
 
@@ -319,6 +320,112 @@ class TestRetryLogic:
         assert mock_sleep.call_args_list[0][0][0] == 2.0   # 2 * 2^0
         assert mock_sleep.call_args_list[1][0][0] == 4.0   # 2 * 2^1
 
+class TestOrderPlacerBudgetEnforcement:
+    """Budget reservation + release semantics inside place_order_from_params."""
+
+    def _params(self, qty=10, price=85):
+        return OrderParams(
+            ticker="BUDGET-TEST",
+            side="no",
+            action="buy",
+            price_cents=price,
+            quantity=qty,
+            post_only=True,
+            market_snapshot={"yes_bid": 15},
+        )
+
+    def test_budget_rejects_when_over_cap(self):
+        mock_client = MagicMock()
+        budget = OrderBudget(cap_cents=500, committed_cents=0)  # $5 cap
+        placer = OrderPlacer(client=mock_client, dry_run=False, budget=budget)
+
+        # 10 contracts × 85c = $8.50 > $5
+        result = placer.place_order_from_params(self._params(), strategy="mentions")
+
+        assert result.success is False
+        assert result.error == "account notional cap reached"
+        mock_client.create_order.assert_not_called()
+        assert budget.reserved_cents == 0
+
+    def test_budget_allows_when_under_cap_and_reserves(self):
+        mock_client = MagicMock()
+        mock_client.create_order.return_value = {"order": {"order_id": "ord-ok"}}
+        budget = OrderBudget(cap_cents=2000, committed_cents=0)  # $20 cap
+        placer = OrderPlacer(client=mock_client, dry_run=False, budget=budget)
+
+        result = placer.place_order_from_params(self._params(), strategy="mentions")
+
+        assert result.success is True
+        assert budget.reserved_cents == 850
+
+    def test_budget_releases_on_kalshi_api_error(self):
+        mock_client = MagicMock()
+        mock_client.create_order.side_effect = KalshiAPIError(400, "Insufficient balance")
+        budget = OrderBudget(cap_cents=2000, committed_cents=0)
+        placer = OrderPlacer(client=mock_client, dry_run=False, budget=budget)
+
+        result = placer.place_order_from_params(self._params(), strategy="mentions")
+
+        assert result.success is False
+        # Reservation returned to budget so next attempt has full headroom.
+        assert budget.reserved_cents == 0
+        assert budget.remaining_cents == 2000
+
+    def test_budget_releases_on_unexpected_exception(self):
+        mock_client = MagicMock()
+        mock_client.create_order.side_effect = RuntimeError("boom")
+        budget = OrderBudget(cap_cents=2000, committed_cents=0)
+        placer = OrderPlacer(client=mock_client, dry_run=False, budget=budget)
+
+        result = placer.place_order_from_params(self._params(), strategy="mentions")
+
+        assert result.success is False
+        assert budget.reserved_cents == 0
+
+    def test_dry_run_with_budget_reserves_but_does_not_release(self):
+        """Dry-run simulates a resting order, so the reservation stays."""
+        mock_client = MagicMock()
+        budget = OrderBudget(cap_cents=2000, committed_cents=0)
+        placer = OrderPlacer(client=mock_client, dry_run=True, budget=budget)
+
+        result = placer.place_order_from_params(self._params(), strategy="mentions")
+
+        assert result.success is True
+        assert result.dry_run is True
+        assert budget.reserved_cents == 850
+        mock_client.create_order.assert_not_called()
+
+    def test_no_budget_falls_back_to_previous_behavior(self):
+        """budget=None means no cap check; existing call sites stay green."""
+        mock_client = MagicMock()
+        mock_client.create_order.return_value = {"order": {"order_id": "ord-ok"}}
+        placer = OrderPlacer(client=mock_client, dry_run=False, budget=None)
+
+        result = placer.place_order_from_params(self._params(), strategy="mentions")
+
+        assert result.success is True
+        mock_client.create_order.assert_called_once()
+
+    def test_budget_exhausts_across_multiple_orders(self):
+        """Sequential orders drain budget; first few succeed, then reject."""
+        mock_client = MagicMock()
+        mock_client.create_order.return_value = {"order": {"order_id": "ord-ok"}}
+        budget = OrderBudget(cap_cents=1700, committed_cents=0)  # exactly $17
+        placer = OrderPlacer(client=mock_client, dry_run=False, budget=budget)
+
+        # Two $8.50 orders fit ($17 cap); third must reject.
+        r1 = placer.place_order_from_params(self._params(), strategy="mentions")
+        r2 = placer.place_order_from_params(self._params(), strategy="mentions")
+        r3 = placer.place_order_from_params(self._params(), strategy="mentions")
+
+        assert r1.success is True
+        assert r2.success is True
+        assert r3.success is False
+        assert r3.error == "account notional cap reached"
+        assert mock_client.create_order.call_count == 2
+
+
+class TestRetryWithParams:
     @patch("src.order_placer.time.sleep")
     def test_retry_works_with_place_order_from_params(self, mock_sleep):
         """Retry also works via place_order_from_params."""
