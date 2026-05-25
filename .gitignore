@@ -31,6 +31,9 @@ pnl_reports/
 .vscode/
 *.swp
 
+# macOS
+.DS_Store
+
 # Worktrees
 .worktrees/
 
